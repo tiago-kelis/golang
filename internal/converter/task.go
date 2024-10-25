@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"imersaofc/internal/rabbitmq"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -12,11 +13,14 @@ import (
 	"sort"
 	"strconv"
 	"time"
+
+	"github.com/streadway/amqp"
 )
 
 // VideoConverter handles video conversion tasks
 type VideoConverter struct {
-	db *sql.DB
+	db             *sql.DB
+	rabbitmqClient *rabbitmq.RabbitClient
 }
 
 // VideoTask represents a video conversion task
@@ -26,23 +30,25 @@ type VideoTask struct {
 }
 
 // NewVideoConverter creates a new instance of VideoConverter
-func NewVideoConverter(db *sql.DB) *VideoConverter {
+func NewVideoConverter(rabbitmqClient *rabbitmq.RabbitClient, db *sql.DB) *VideoConverter {
 	return &VideoConverter{
-		db: db,
+		rabbitmqClient: rabbitmqClient,
+		db:             db,
 	}
 }
 
 // HandleMessage processes a video conversion message
-func (vc *VideoConverter) HandleMessage(msg []byte) {
+func (vc *VideoConverter) Handle(d amqp.Delivery, conversionExch, confirmationKey, confirmationQueue string) {
 	var task VideoTask
 
-	if err := json.Unmarshal(msg, &task); err != nil {
+	if err := json.Unmarshal(d.Body, &task); err != nil {
 		vc.logError(task, "Failed to deserialize message", err)
 		return
 	}
 
 	// Check if the video has already been processed
 	if IsProcessed(vc.db, task.VideoID) {
+		d.Ack(false)
 		slog.Warn("Video already processed", slog.Int("video_id", task.VideoID))
 		return
 	}
@@ -60,7 +66,12 @@ func (vc *VideoConverter) HandleMessage(msg []byte) {
 	if err != nil {
 		vc.logError(task, "Failed to mark video as processed", err)
 	}
+
+	d.Ack(false)
 	slog.Info("Video marked as processed", slog.Int("video_id", task.VideoID))
+
+	confirmationMessage := []byte(fmt.Sprintf(`{video_id: %d, "path" %s}`, task.VideoID, task.Path))
+	err = vc.rabbitmqClient.PublishMessage(conversionExch, confirmationKey, confirmationQueue, confirmationMessage)
 }
 
 // processVideo handles video processing (merging chunks and converting)

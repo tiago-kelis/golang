@@ -3,16 +3,17 @@ package main
 import (
 	"database/sql"
 	"fmt"
+	"imersaofc/internal/converter"
+	"imersaofc/internal/rabbitmq"
+	"imersaofc/pkg/log"
 	"log/slog"
 	"os"
 	"os/signal"
 	"sync"
 	"syscall"
 
-	"imersaofc/internal/converter"
-	"imersaofc/pkg/log"
-
 	_ "github.com/lib/pq"
+	"github.com/streadway/amqp"
 )
 
 // connectPostgres establishes a connection with PostgreSQL using environment variables for configuration.
@@ -53,44 +54,61 @@ func main() {
 	logger := log.NewLogger(isDebug)
 	slog.SetDefault(logger)
 
+	// ctx, cancel := context.WithCancel(context.Background())
+	// defer cancel()
+
 	signalChan := make(chan os.Signal, 1)
 	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
 
 	db, err := connectPostgres()
 	if err != nil {
-		return
+		panic(err)
 	}
 	defer db.Close()
 
-	videoConverter := converter.NewVideoConverter(db)
+	rabbitMQURL := getEnvOrDefault("RABBITMQ_URL", "amqp://guest:guest@rabbitmq:5672/")
+	rabbitClient, err := rabbitmq.NewRabbitClint(rabbitMQURL)
+	if err != nil {
+		slog.Error("Failed to connect to RabbitMQ", slog.String("error", err.Error()))
+		panic(err)
+	}
+	defer rabbitClient.Close()
 
-	msgs := make(chan []byte)
-	go sendMsgs(5, msgs)
+	conversionExch := getEnvOrDefault("CONVERSION_EXCHANGE", "conversion_exchange")
+	queueName := getEnvOrDefault("QUEUE_NAME", "video_conversion_queue")
+	conversionKey := getEnvOrDefault("CONVERSION_KEY", "conversion")
+	confirmationKey := getEnvOrDefault("CONFIRMATION_KEY", "finish-conversion")
+	// rootPath := getEnvOrDefault("VIDEO_ROOT_PATH", "/media/uploads")
+	confirmationQueue := "video_confirmation_queue" // Nome da fila de confirmação
+
+	videoConverter := converter.NewVideoConverter(rabbitClient, db)
+
+	// Consumir mensagens da fila de conversão
+	msgs, err := rabbitClient.ConsumeMessages(conversionExch, conversionKey, queueName)
+	if err != nil {
+		slog.Error("Failed to consume messages", slog.String("error", err.Error()))
+		return
+	}
 
 	var wg sync.WaitGroup
 	go func() {
 		for d := range msgs {
 			wg.Add(1)
-			go func(delivery []byte) {
+			go func(delivery amqp.Delivery) {
 				defer wg.Done()
-				videoConverter.HandleMessage(delivery)
+				videoConverter.Handle(delivery, conversionExch, confirmationKey, confirmationQueue)
+
 			}(d)
 		}
 	}()
 
+	slog.Info("Waiting for messages from RabbitMQ")
 	<-signalChan
 	slog.Info("Shutdown signal received, finalizing processing...")
+
+	// cancel()
 
 	wg.Wait()
 
 	slog.Info("Processing completed, exiting...")
-}
-
-func sendMsgs(totalMsgs int, output chan []byte) {
-	// generate json messages. Format: {"video_id": 1, "path": "/media/uploads/1"}
-	for i := range totalMsgs {
-		i++
-		msg := fmt.Sprintf(`{"video_id": %d, "path": "/media/uploads/%d"}`, i, i)
-		output <- []byte(msg)
-	}
 }
